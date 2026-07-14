@@ -194,13 +194,30 @@ bot.action(/^pick:(\w+)$/, async (ctx) => {
   }
 });
 
+// Comandos desconocidos
+bot.on('text', async (ctx, next) => {
+  if (ctx.message.text.startsWith('/')) {
+    return ctx.reply(
+      '❓ Comando no reconocido.\n\n' +
+      'Comandos disponibles:\n' +
+      '/resumen — Resumen del mes\n' +
+      '/ultimo — Últimos 5 gastos\n' +
+      '/categorias — Ver categorías\n' +
+      '/help — Ayuda\n\n' +
+      'O enviá un gasto: `café 350`',
+      { parse_mode: 'Markdown' }
+    );
+  }
+  return next();
+});
+
 // Mensaje de texto: intentar parsear como gasto
 bot.on('text', async (ctx) => {
   try {
     const parsed = parseExpenseMessage(ctx.message.text);
     if (!parsed) {
       return ctx.reply(
-        'No pude entender el gasto. Probá con:\n`café 350` o `netflix 8 usd`',
+        'No pude entender el gasto. Probá con:\n`café 350` o `netflix 8 usd`\n\nUsá /help para ver los comandos.',
         { parse_mode: 'Markdown' }
       );
     }
