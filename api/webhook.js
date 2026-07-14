@@ -2,6 +2,7 @@ const { Telegraf, Markup } = require('telegraf');
 const { parseExpenseMessage } = require('../lib/parser');
 const { suggestCategory, getCategories } = require('../lib/categories');
 const { createExpense, getMonthSummary, getLastExpenses } = require('../lib/expenses');
+const { savePending, getPending, deletePending } = require('../lib/pending');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
@@ -73,7 +74,6 @@ bot.command('resumen', async (ctx) => {
     }
     msg += `📝 Cantidad de gastos: ${summary.count}\n\n`;
 
-    // Por tipo
     msg += `📌 *Por tipo:*\n`;
     msg += `• Fijo: $${summary.byType.fijo.ARS.toLocaleString('es-AR')}`;
     if (summary.byType.fijo.USD > 0) msg += ` + U$S${summary.byType.fijo.USD}`;
@@ -82,7 +82,6 @@ bot.command('resumen', async (ctx) => {
     if (summary.byType.variable.USD > 0) msg += ` + U$S${summary.byType.variable.USD}`;
     msg += `\n\n`;
 
-    // Por categoría
     msg += `📂 *Por categoría:*\n`;
     const sorted = Object.entries(summary.byCategory)
       .sort(([,a], [,b]) => (b.ARS + b.USD * 1000) - (a.ARS + a.USD * 1000));
@@ -123,24 +122,36 @@ bot.command('ultimo', async (ctx) => {
   }
 });
 
-// Callback: confirmar categoría sugerida
-bot.action(/^confirm_(.+)$/, async (ctx) => {
+// Callback: confirmar con categoría (formato: "ok:<pendingId>:<categoryId>")
+bot.action(/^ok:(\w+):(\d+)$/, async (ctx) => {
   try {
-    const payload = JSON.parse(ctx.match[1]);
-    const { amount, description, currency, categoryId, expenseTypeId } = payload;
+    const pendingId = ctx.match[1];
+    const categoryId = parseInt(ctx.match[2]);
+
+    const pending = await getPending(pendingId);
+    if (!pending) {
+      await ctx.answerCbQuery('Gasto expirado, enviá de nuevo.');
+      return;
+    }
+
+    // Buscar expense_type_id de la categoría
+    const categories = await getCategories();
+    const cat = categories.find(c => c.id === categoryId);
 
     const expense = await createExpense({
-      description,
-      amount,
-      currency,
+      description: pending.description,
+      amount: pending.amount,
+      currency: pending.currency,
       categoryId,
-      expenseTypeId,
+      expenseTypeId: cat?.expense_type_id || 2,
       telegramMessageId: ctx.callbackQuery.message?.message_id,
     });
 
-    const symbol = currency === 'USD' ? 'U$S' : '$';
+    await deletePending(pendingId);
+
+    const symbol = pending.currency === 'USD' ? 'U$S' : '$';
     await ctx.editMessageText(
-      `✅ Gasto registrado!\n${symbol}${amount.toLocaleString('es-AR')} — ${description}`,
+      `✅ Registrado: ${symbol}${pending.amount.toLocaleString('es-AR')} — ${pending.description} [${cat?.name || '?'}]`
     );
     await ctx.answerCbQuery('Registrado!');
   } catch (err) {
@@ -149,33 +160,32 @@ bot.action(/^confirm_(.+)$/, async (ctx) => {
   }
 });
 
-// Callback: elegir otra categoría
-bot.action(/^pick_cat_(.+)$/, async (ctx) => {
+// Callback: mostrar selector de categorías (formato: "pick:<pendingId>")
+bot.action(/^pick:(\w+)$/, async (ctx) => {
   try {
-    const payload = JSON.parse(ctx.match[1]);
+    const pendingId = ctx.match[1];
+    const pending = await getPending(pendingId);
+    if (!pending) {
+      await ctx.answerCbQuery('Gasto expirado, enviá de nuevo.');
+      return;
+    }
+
     const categories = await getCategories();
 
-    // Mostrar todas las categorías como botones (de a 2 por fila)
-    const buttons = categories.map(cat => {
-      const confirmPayload = JSON.stringify({
-        ...payload,
-        categoryId: cat.id,
-        expenseTypeId: cat.expense_type_id,
-      });
-      return Markup.button.callback(cat.name, `confirm_${confirmPayload}`);
-    });
+    // Botones cortos: "ok:<pendingId>:<catId>" — siempre < 64 bytes
+    const buttons = categories.map(cat =>
+      Markup.button.callback(cat.name, `ok:${pendingId}:${cat.id}`)
+    );
 
     const rows = [];
     for (let i = 0; i < buttons.length; i += 2) {
       rows.push(buttons.slice(i, i + 2));
     }
 
+    const symbol = pending.currency === 'USD' ? 'U$S' : '$';
     await ctx.editMessageText(
-      `Elegí categoría para: *${payload.description}* ${payload.currency === 'USD' ? 'U$S' : '$'}${payload.amount}`,
-      {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard(rows),
-      }
+      `Elegí categoría para: ${pending.description} ${symbol}${pending.amount}`,
+      Markup.inlineKeyboard(rows)
     );
     await ctx.answerCbQuery();
   } catch (err) {
@@ -186,51 +196,50 @@ bot.action(/^pick_cat_(.+)$/, async (ctx) => {
 
 // Mensaje de texto: intentar parsear como gasto
 bot.on('text', async (ctx) => {
-  const parsed = parseExpenseMessage(ctx.message.text);
-  if (!parsed) {
-    return ctx.reply(
-      'No pude entender el gasto. Probá con:\n`café 350` o `netflix 8 usd`',
-      { parse_mode: 'Markdown' }
-    );
-  }
+  try {
+    const parsed = parseExpenseMessage(ctx.message.text);
+    if (!parsed) {
+      return ctx.reply(
+        'No pude entender el gasto. Probá con:\n`café 350` o `netflix 8 usd`',
+        { parse_mode: 'Markdown' }
+      );
+    }
 
-  const { amount, description, currency } = parsed;
-  const suggested = await suggestCategory(description);
+    const { amount, description, currency } = parsed;
+    const suggested = await suggestCategory(description);
 
-  const symbol = currency === 'USD' ? 'U$S' : '$';
-  const basePayload = { amount, description, currency };
+    // Guardar gasto pendiente en Supabase con ID corto
+    const pendingId = await savePending({ amount, description, currency });
 
-  if (suggested) {
-    const confirmPayload = JSON.stringify({
-      ...basePayload,
-      categoryId: suggested.id,
-      expenseTypeId: suggested.expense_type_id,
-    });
-    const changePayload = JSON.stringify(basePayload);
+    const symbol = currency === 'USD' ? 'U$S' : '$';
 
-    ctx.reply(
-      `💰 *${symbol}${amount.toLocaleString('es-AR')}* — ${description}\n📂 Categoría: *${suggested.name}*`,
-      {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [
-            Markup.button.callback('✅ Confirmar', `confirm_${confirmPayload}`),
-            Markup.button.callback('🔄 Cambiar', `pick_cat_${changePayload}`),
-          ],
-        ]),
-      }
-    );
-  } else {
-    const changePayload = JSON.stringify(basePayload);
-    ctx.reply(
-      `💰 *${symbol}${amount.toLocaleString('es-AR')}* — ${description}\n⚠️ No encontré categoría. Elegí una:`,
-      {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [Markup.button.callback('📂 Elegir categoría', `pick_cat_${changePayload}`)],
-        ]),
-      }
-    );
+    if (suggested) {
+      ctx.reply(
+        `💰 *${symbol}${amount.toLocaleString('es-AR')}* — ${description}\n📂 Categoría: *${suggested.name}*`,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [
+              Markup.button.callback('✅ Confirmar', `ok:${pendingId}:${suggested.id}`),
+              Markup.button.callback('🔄 Cambiar', `pick:${pendingId}`),
+            ],
+          ]),
+        }
+      );
+    } else {
+      ctx.reply(
+        `💰 *${symbol}${amount.toLocaleString('es-AR')}* — ${description}\n⚠️ No encontré categoría. Elegí una:`,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback('📂 Elegir categoría', `pick:${pendingId}`)],
+          ]),
+        }
+      );
+    }
+  } catch (err) {
+    console.error('Error processing message:', err);
+    ctx.reply('❌ Error al procesar el gasto.');
   }
 });
 
